@@ -1,0 +1,199 @@
+---
+title: "Extracting City Relations from Language"
+output: html_notebook
+---
+```{r dependencies}
+library('MASS')
+library('ggplot2')
+library('ggrepel')
+```
+
+```{r parse city data from wikipedia}
+#list of us cities by population wikipedia article downloaded October 2018
+city_data = readLines("city_data.txt")
+name = c()
+state = c()
+pop2017 = c()
+pop2010 = c()
+growth = c()
+area = c()
+density= c()
+lat = c()
+lon = c()
+for(i in 1:(length(city_data)/11)){
+    j = 11*i-10
+    name[i] = city_data[j+1]
+    state[i] = city_data[j+2]
+    pop2017[i] = city_data[j+3]
+    pop2010[i] = city_data[j+4]
+    growth[i] = city_data[j+5]
+    area[i] = city_data[j+7]
+    density[i] = city_data[j+9]
+    lat[i] = strsplit(city_data[j+10], " ")[[1]][1]
+    lon[i] = strsplit(city_data[j+10], " ")[[1]][2]
+}
+#clean
+name = gsub("[[:digit:]]|\\[|\\]", "", name)
+state = trimws(state)
+pop2017 = as.numeric(gsub(",", "", pop2017))
+pop2010 = as.numeric(gsub(",", "", pop2010))
+growth = as.numeric(gsub("−", "-", gsub("[+,%]", "", growth)))
+area = as.numeric(trimws(gsub("[,]", "", gsub("km2", "", area))))
+density = as.numeric(trimws(gsub("[,]", "", gsub("/km2", "", density))))
+lat = as.numeric(trimws(gsub("[°N]", "", lat)))
+lon = as.numeric(trimws(gsub("[°W]", "", lon)))
+city_df = data.frame(name = name, state = state, pop2017 = pop2017,
+                     pop2010 = pop2010, growth = growth, area = area,
+                     density = density, lat = lat, lon = lon)
+write.csv(city_df, file = "city_data.csv")
+
+```
+
+```{r get word2vec entity representations}
+#downloaded data from https://code.google.com/archive/p/word2vec/
+#extracted bin file to csv using script found on discussion group
+entity_names = read.csv("~/Documents/datasets/freebase-vectors-skipgram1000-en.csv", colClasses = c("character", rep("NULL", 1000)), nrows = 100000, sep = " ")
+entity_names = gsub("/en/", "", entity_names$word)
+entity_name_indices = c()
+#match city names to manual list of entity names, which are not entirely consistent
+freebase_city_names = c("new_york", "los_angeles", "chicago", "houston", "phoenix", "philadelphia", "san_antonio", 
+               "san_diego", "dallas", "san_jose", "austin", "jacksonville", "san_francisco", "columbus_ohio", 
+               "fort_worth", "indianapolis", "charlotte", "seattle", "denver", "washington_united_states",
+               "boston_massachusetts", "el_paso", "detroit_michigan", "nashville_tennessee", "memphis_tennessee", "portland",
+               "oklahoma_city", "las_vegas", "louisville", "baltimore", "milwaukee", "albuquerque",
+               "tucson", "fresno_california", "sacramento", "mesa", "kansas_city", "atlanta", 
+               "long_beach", "omaha_nebraska","raleigh", "colorado_springs", "miami", "virginia_beach", "oakland_california",
+               "minneapolis", "tulsa", "arlington_texas", "new_orleans", "wichita", "cleveland_ohio", "tampa",
+               "bakersfield", "aurora", "anaheim", "honolulu", "santa_ana", "riverside",
+               "corpus_christi", "lexington", "stockton", "st_louis_missouri", "saint_paul", "henderson",
+               "pittsburgh", "cincinnati_ohio", "anchorage", "greensboro", "plano", "newark", "lincoln", "orlando",
+               "irvine", "toledo_ohio", "jersey_city", "chula_vista", "durham_north_carolina", "fort_wayne", "st_petersburg", 
+               "laredo", "buffalo", "madison", "lubbock", "chandler", "scottsdale", "reno",
+               "glendale", "norfolk", "winston_salem", "north_las_vegas", "gilbert", "chesapeake", "irving", "hialeah",
+               "garland", "fremont", "richmond_virginia", "boise", "baton_rouge", "des_moines")
+
+for (n in 1:length(city_df$name)){
+    entity_name_indices[n] = which(entity_names == freebase_city_names[n])
+}
+
+#add freebase entity frequency as a feature
+city_df$entity_rank = entity_name_indices
+
+#load full vectors
+entity_vectors = read.csv("~/Documents/datasets/freebase-vectors-skipgram1000-en.csv", nrows = 50000, sep = " ")
+city_vectors = entity_vectors[city_df$entity_rank,]
+city_vectors$word = city_df$name
+names(city_vectors)[1] = "name"
+```
+
+```{r map of actual locations}
+ggplot(data = city_df[!city_df$name %in% c("Anchorage", "Honolulu"),],
+       aes(x = -lon, y = lat, label = name)) + geom_point() + geom_text_repel() +
+    labs(x = "Longitude", y = "Latitude", title = "City Locations")
+```
+
+```{r define functions for distance measures}
+geographic_dist <- function(lat1, lon1, lat2, lon2, degrees = T){
+    if (degrees){
+        #convert degrees to radians
+        lat1 = lat1 * (pi/180)
+        lon1 = lon1 * (pi/180)
+        lat2 = lat2 * (pi/180)
+        lon2 = lon2 * (pi/180)        
+    }
+    r = 6371 #radius of earth
+    d = 2*r*asin(sqrt(sin((lat2 - lat1)/2)^2 + cos(lat1)*cos(lat2)*sin((lon2 - lon1)/2)^2))
+    d
+}
+
+cosine_dist <- function(vec1, vec2){
+    1 - sum(vec1*vec2)/sqrt(sum(vec1^2))/sqrt(sum(vec2^2))
+}
+
+euclidean_dist <- function(vec1, vec2){
+    sqrt(sum((vec1-vec2)^2))
+}
+```
+
+```{r compute pairwise distances}
+n = dim(city_df)[1]
+geographic_distances = matrix(NA, nrow = n, ncol = n)
+linguistic_distances = matrix(NA, nrow = n, ncol = n)
+
+for(i in 1:(n-1)){
+    for(j in (i+1):n){
+        geographic_distances[i, j] = geographic_dist(city_df$lat[i], city_df$lon[i], city_df$lat[j], city_df$lon[j])
+        linguistic_distances[i, j] = cosine_dist(city_vectors[i, 2:dim(city_vectors)[2]],city_vectors[j, 2:dim(city_vectors)[2]])
+    }
+}
+#fill lower triangle
+for (i in 1:n){
+    for(j in 1:n){
+        if (j < i){
+            geographic_distances[i,j] = geographic_distances[j,i]
+            linguistic_distances[i,j] = linguistic_distances[j,i]
+        }
+    }
+}
+
+```
+
+```{r scatterplots for regression}
+mask = !is.na(geographic_distances)
+ggplot(data = data.frame(x = geographic_distances[mask], y = linguistic_distances[mask]),
+       aes(x = x, y = y)) +
+    geom_point(size = .6) + 
+    labs(x = "Geographic distance (km)", y = "Semantic cosine distance", title = "Relationship between two distance measures")
+       
+ggplot(data = data.frame(x = log(geographic_distances[mask]), y = linguistic_distances[mask]),
+       aes(x = x, y = y)) +
+    geom_point(size = .6) + 
+    labs(x = "Log geographic distance", y = "Semantic cosine distance", title = "After log transform")
+```
+
+```{r fit regression}
+linguistic_distances = (linguistic_distances - mean(linguistic_distances[mask]))/
+    sd(linguistic_distances[mask])
+mod = lm(log(geographic_distances[mask]) ~ linguistic_distances[mask])
+```
+
+```{r mantel test}
+coefs = rep(NA, 1000)
+for(i in 1:1000){
+    samples = sample(100, replace = F)
+    sampled_ling = linguistic_distances[samples, samples]
+    coefs[i] = lm(log(geographic_distances[mask]) ~ sampled_ling[mask])$coefficients[2]
+}
+max(coefs)
+```
+
+```{r bootstrap}
+coefs = rep(NA, 1000)
+for(i in 1:1000){
+    samples = sample(100, replace = T)
+    sampled_geo = geographic_distances[samples, samples]
+    sampled_ling = linguistic_distances[samples, samples]
+    coefs[i] = lm(log(sampled_geo[mask & !is.na(sampled_geo)]) ~ scale(sampled_ling[mask & !is.na(sampled_ling)]))$coefficients[2]
+}
+print(c(quantile(coefs, .025), quantile(coefs, .975)))
+```
+
+```{r reconstruct map}
+a = mod$coefficients[1]
+b = mod$coefficients[2]
+reconstructed_distances = exp(matrix(a + b*c(linguistic_distances), nrow = 100, ncol = 100))
+d = as.dist(reconstructed_distances)
+#fit <- cmdscale(d,eig=TRUE, k=2)
+fit <- isoMDS(d, k=2)
+x <- fit$points[,1]
+y <- fit$points[,2]
+
+ggplot(data = data.frame(name = city_df$name, x = -x, y = -y),
+       aes(x = x, y = y, label = name)) + geom_point() + geom_text_repel() +
+    labs(x = "Coordinate 1", y = "Coordinate 2", title = "Reconstructed City Locations")
+
+ggplot(data = data.frame(name = city_df$name, x = -x, y = -y)[city_df$name != "Norfolk",],
+       aes(x = x, y = y, label = name)) + geom_point() + geom_text_repel() +
+    labs(x = "Coordinate 1", y = "Coordinate 2", title = "Reconstructed City Locations")
+
+```
